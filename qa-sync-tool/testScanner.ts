@@ -1958,6 +1958,7 @@ export interface Suggestion {
   whyNeededOpt2?: string;
   classification?: string;
   detectedChanges?: string;
+  deleteFile?: boolean;
 }
 
 export function findExternalDependencies(importsList: string[]): string[] {
@@ -2453,6 +2454,101 @@ export function optimizeAndCleanImports(fileContent: string): string {
   return combined;
 }
 
+export function cleanUnusedCode(content: string): string {
+  let code = content;
+  let iteration = 0;
+  const maxIterations = 5;
+
+  while (iteration < maxIterations) {
+    const originalCode = code;
+
+    // 1. Remove empty describe blocks
+    const emptyDescribeRegex = /test\.describe\(\s*(['"`])[\s\S]*?\1\s*,\s*(?:async\s*)?\(\s*\)\s*=>\s*\{\s*\}\s*\);?/g;
+    code = code.replace(emptyDescribeRegex, '');
+
+    // 2. Find all function declarations: function <name>(...) { ... }
+    const funcDeclRegex = /(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(/g;
+    let match;
+    const functionsToRemove: { start: number; end: number; name: string }[] = [];
+
+    while ((match = funcDeclRegex.exec(code)) !== null) {
+      const funcName = match[1];
+      const startIdx = match.index;
+      
+      // Find the opening brace '{'
+      let braceIdx = code.indexOf('{', startIdx);
+      if (braceIdx === -1) continue;
+
+      // Find matching closing brace
+      let openBraces = 1;
+      let i = braceIdx + 1;
+      while (i < code.length && openBraces > 0) {
+        if (code[i] === '{') openBraces++;
+        else if (code[i] === '}') openBraces--;
+        i++;
+      }
+
+      if (openBraces === 0) {
+        const endIdx = i;
+        const blockText = code.substring(startIdx, endIdx);
+        
+        // Count occurrences of funcName outside of this block
+        const escapedName = funcName.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+        const regex = new RegExp(`\\b${escapedName}\\b`, 'g');
+        const totalMatches = (code.match(regex) || []).length;
+        const blockMatches = (blockText.match(regex) || []).length;
+
+        // If all occurrences are within the block itself, it is unused!
+        if (totalMatches <= blockMatches) {
+          functionsToRemove.push({ start: startIdx, end: endIdx, name: funcName });
+        }
+      }
+    }
+
+    // Remove functions from end to start to keep indices valid
+    functionsToRemove.sort((a, b) => b.start - a.start);
+    for (const fn of functionsToRemove) {
+      code = code.substring(0, fn.start) + code.substring(fn.end);
+      console.log(`  - Cleaned up unused helper function: "${fn.name}"`);
+    }
+
+    // 3. Find and remove unused const/let variable declarations
+    const varDeclRegex = /\b(const|let)\s+(\w+)\s*=\s*([^;]+);/g;
+    const varsToRemove: { start: number; end: number; name: string }[] = [];
+    while ((match = varDeclRegex.exec(code)) !== null) {
+      const varName = match[2];
+      const startIdx = match.index;
+      const endIdx = match.index + match[0].length;
+
+      // Skip common page objects or configurations we want to keep
+      if (varName === 'config' || varName === 'theSouledStoreLocators') continue;
+
+      const escapedName = varName.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+      const regex = new RegExp(`\\b${escapedName}\\b`, 'g');
+      const totalMatches = (code.match(regex) || []).length;
+
+      // If it only appears once (its declaration), it is unused!
+      if (totalMatches === 1) {
+        varsToRemove.push({ start: startIdx, end: endIdx, name: varName });
+      }
+    }
+
+    varsToRemove.sort((a, b) => b.start - a.start);
+    for (const v of varsToRemove) {
+      code = code.substring(0, v.start) + code.substring(v.end);
+      console.log(`  - Cleaned up unused variable: "${v.name}"`);
+    }
+
+    if (code === originalCode) {
+      break;
+    }
+    iteration++;
+  }
+
+  code = code.replace(/\n{3,}/g, '\n\n').trim() + '\n';
+  return code;
+}
+
 export function applyChanges(
   projectRoot: string,
   suggestions: Suggestion[],
@@ -2605,8 +2701,8 @@ test.describe('${describeTitle}', () => {\n`;
     }
 
     for (const sug of fileSugs) {
-      if (sug.action === 'MODIFY' && sug.proposedCode) {
-        const cleanedProposed = cleanProposedCode(sug.proposedCode);
+      if (sug.action === 'MODIFY') {
+        const cleanedProposed = sug.proposedCode ? cleanProposedCode(sug.proposedCode) : '';
         const normSugId = normalizeRequirementId(sug.requirementId);
         let matchedCase = segments.find(seg =>
           seg.type === 'testCase' && (
@@ -2624,7 +2720,8 @@ test.describe('${describeTitle}', () => {\n`;
 
         if (matchedCase && matchedCase.type === 'testCase') {
           const tc = matchedCase.structure;
-          const blockIndex = tc.blocks.findIndex((b: any) => {
+          // Primary match: find block by requirement ID or matching original code
+          let blockIndex = tc.blocks.findIndex((b: any) => {
             const bIds = (b.requirementIds || (b.requirementId ? [b.requirementId] : [])).map(normalizeRequirementId);
             return bIds.includes(normSugId) ||
               (sug.originalCode && normalizeCode(b.code) === normalizeCode(sug.originalCode)) ||
@@ -2632,22 +2729,85 @@ test.describe('${describeTitle}', () => {\n`;
                 normalizeCode(sug.originalCode).includes(normalizeRequirementId(b.requirementId)) &&
                 !validRequirementIds.includes(normalizeRequirementId(b.requirementId)));
           });
+
+          if (blockIndex === -1 && tc.blocks.length === 1) {
+            blockIndex = 0;
+          }
+
           if (blockIndex !== -1) {
+            // ── Standard path: replace the matched block in place ──────────────
             const matchedBlock = tc.blocks[blockIndex];
             const oldId = (matchedBlock.requirementId !== sug.requirementId) ? matchedBlock.requirementId : undefined;
-            tc.blocks[blockIndex].code = ensureRequirementComment(cleanedProposed, sug.requirementId, oldId);
+
+            const hasDeletionPatch = sug.patchDiff && sug.patchDiff.split('\n').some(l => l.trim().startsWith('-'));
+            let newCode = '';
+            if (hasDeletionPatch && sug.patchDiff) {
+              newCode = applyPatchDiff(matchedBlock.code, sug.patchDiff);
+            } else {
+              newCode = cleanedProposed;
+            }
+
+            tc.blocks[blockIndex].code = ensureRequirementComment(newCode, sug.requirementId, oldId);
             tc.blocks[blockIndex].requirementId = sug.requirementId;
             tc.blocks[blockIndex].requirementIds = [sug.requirementId];
             console.log(`  ${YELLOW}* Modified block ${sug.requirementId} in test: "${tc.title}" in ${path.basename(filePath)}${RESET}`);
+
           } else {
-            const blockCode = ensureRequirementComment(cleanedProposed, sug.requirementId);
-            tc.blocks.push({
-              type: 'requirement',
-              requirementId: sug.requirementId,
-              requirementIds: [sug.requirementId],
-              code: blockCode
-            });
-            console.log(`  ${GREEN}+ Added block ${sug.requirementId} to test: "${tc.title}" in ${path.basename(filePath)}${RESET}`);
+            // ── Fallback: SCOPE C patch — merge missing lines into existing block ──
+            // A MODIFY must NEVER push a new block. Find the best target block to merge into:
+            //   1. Any block whose requirementId is the same (case-insensitive substring match)
+            //   2. The last 'requirement' block in the test
+            //   3. The last block of any type in the test
+            let targetIdx = tc.blocks.findIndex((b: any) =>
+              b.requirementId && normalizeRequirementId(b.requirementId).includes(normSugId)
+            );
+            if (targetIdx === -1) {
+              targetIdx = [...tc.blocks].reverse().findIndex((b: any) => b.type === 'requirement');
+              if (targetIdx !== -1) targetIdx = tc.blocks.length - 1 - targetIdx;
+            }
+            if (targetIdx === -1 && tc.blocks.length > 0) {
+              targetIdx = tc.blocks.length - 1;
+            }
+
+            if (targetIdx !== -1) {
+              // Merge: append only the lines from cleanedProposed that are not already in the block
+              const existingBlock = tc.blocks[targetIdx];
+              const existingLines = new Set(
+                existingBlock.code.split('\n').map((l: string) => l.trim()).filter(Boolean)
+              );
+              const newLines = cleanedProposed
+                .split('\n')
+                .filter((l: string) => {
+                  const t = l.trim();
+                  // Skip lines that are already present, empty, or are bare comment-only lines
+                  return t.length > 0 && !existingLines.has(t);
+                });
+
+              if (newLines.length > 0) {
+                // Insert new lines before the closing brace of the block
+                const blockLines = existingBlock.code.split('\n');
+                // Find last non-empty, non-closing-brace line to insert after
+                let insertAt = blockLines.length;
+                for (let bi = blockLines.length - 1; bi >= 0; bi--) {
+                  const stripped = blockLines[bi].trimEnd();
+                  if (stripped.endsWith('}') || stripped === '') continue;
+                  insertAt = bi + 1;
+                  break;
+                }
+                blockLines.splice(insertAt, 0, ...newLines);
+                tc.blocks[targetIdx].code = ensureRequirementComment(blockLines.join('\n'), sug.requirementId);
+                tc.blocks[targetIdx].requirementIds = [
+                  ...(tc.blocks[targetIdx].requirementIds || []),
+                  sug.requirementId
+                ].filter((v, i, a) => a.indexOf(v) === i);
+                console.log(`  ${YELLOW}* Patched ${sug.requirementId} into existing block in test: "${tc.title}" in ${path.basename(filePath)}${RESET}`);
+              } else {
+                console.log(`  ${DIM}⏭ MODIFY for ${sug.requirementId} skipped — all patch lines already present in "${tc.title}"${RESET}`);
+              }
+            } else {
+              // No block at all found — cannot apply a MODIFY as an ADD. Warn and skip.
+              console.log(`  ${YELLOW}⚠ MODIFY for ${sug.requirementId} skipped — no existing block found in "${tc.title}" to patch into. Use ADD instead.${RESET}`);
+            }
           }
         }
       }
@@ -2818,6 +2978,16 @@ test.describe('${describeTitle}', () => {\n`;
 
     let fileContent = reconstructTestFile(segments);
 
+    // If deleteFile is suggested or removing the last test leaves no test cases, delete the entire file
+    const shouldDeleteFile = fileSugs.some(s => s.deleteFile) || !/\btest\s*\(/.test(fileContent);
+    if (shouldDeleteFile) {
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+        console.log(`  ${RED}- Deleted empty/deprecated test file: ${path.basename(filePath)}${RESET}`);
+      }
+      continue;
+    }
+
     let imports = '';
     if (fileContent.includes('config.') && !fileContent.includes('import { config }')) {
       const configPath = findConfigFilePath(projectRoot) || path.join(projectRoot, 'config.ts');
@@ -2852,8 +3022,43 @@ test.describe('${describeTitle}', () => {\n`;
       fileContent = imports + fileContent;
     }
 
+    fileContent = cleanUnusedCode(fileContent);
     fileContent = optimizeAndCleanImports(fileContent);
 
     fs.writeFileSync(filePath, fileContent, 'utf-8');
   }
+}
+
+export function applyPatchDiff(originalCode: string, patchDiff: string): string {
+  if (!patchDiff || patchDiff.trim().toLowerCase() === 'none') {
+    return originalCode;
+  }
+
+  const originalLines = originalCode.split('\n');
+  const patchLines = patchDiff.split('\n').map(l => l.trimEnd());
+  const linesToRemove = new Set<string>();
+
+  for (const line of patchLines) {
+    if (line.startsWith('-')) {
+      const content = line.substring(1).trim();
+      if (content) {
+        linesToRemove.add(content);
+      }
+    }
+  }
+
+  if (linesToRemove.size === 0) {
+    return originalCode;
+  }
+
+  const resultLines: string[] = [];
+  for (const line of originalLines) {
+    const trimmed = line.trim();
+    if (linesToRemove.has(trimmed)) {
+      continue;
+    }
+    resultLines.push(line);
+  }
+
+  return resultLines.join('\n');
 }

@@ -37,6 +37,7 @@ export interface Suggestion {
   whyNeededOpt2?: string;
   classification?: string;
   detectedChanges?: string;
+  deleteFile?: boolean;
 }
 
 // Stable mapping between previous requirement IDs and current requirement IDs for the active run
@@ -53,6 +54,26 @@ export interface RequirementDiff {
     oldVal: string;
     newVal: string;
   }[];
+}
+
+export function isWordForWordIdentical(s1?: string, s2?: string): boolean {
+  const getWords = (s?: string) =>
+    (s || '')
+      .replace(/\\'/g, "'")
+      .replace(/\\"/g, '"')
+      .replace(/\\`/g, '`')
+      .split(/\s+/)
+      .map(w => w.trim())
+      .filter(Boolean);
+
+  const words1 = getWords(s1);
+  const words2 = getWords(s2);
+
+  if (words1.length !== words2.length) return false;
+  for (let i = 0; i < words1.length; i++) {
+    if (words1[i] !== words2[i]) return false;
+  }
+  return true;
 }
 
 export function compareRequirementDocuments(
@@ -181,16 +202,16 @@ export function compareRequirementDocuments(
       newVal: string;
     }[] = [];
 
-    if (norm(prev.title) !== norm(curr.title)) {
+    if (!isWordForWordIdentical(prev.title, curr.title)) {
       changedFields.push({ field: 'Title', oldVal: prev.title, newVal: curr.title });
     }
-    if (norm(prev.goal) !== norm(curr.goal)) {
+    if (!isWordForWordIdentical(prev.goal, curr.goal)) {
       changedFields.push({ field: 'Goal', oldVal: prev.goal || '', newVal: curr.goal || '' });
     }
-    if (norm(prev.description) !== norm(curr.description)) {
+    if (!isWordForWordIdentical(prev.description, curr.description)) {
       changedFields.push({ field: 'Requirement', oldVal: prev.description, newVal: curr.description });
     }
-    if (norm(prev.expectedResult) !== norm(curr.expectedResult)) {
+    if (!isWordForWordIdentical(prev.expectedResult, curr.expectedResult)) {
       changedFields.push({ field: 'Expected Result', oldVal: prev.expectedResult || '', newVal: curr.expectedResult || '' });
     }
 
@@ -200,30 +221,36 @@ export function compareRequirementDocuments(
       const onlyDocChanged = changedFields.every(
         f => f.field === 'Title' || f.field === 'Goal' || f.field === 'Expected Result'
       );
-      diffs.set(key, {
+      const diffVal: RequirementDiff = {
         id: curr.id,
         classification: onlyDocChanged ? 'REVIEW' : 'MODIFY',
         changedFields
-      });
+      };
+      diffs.set(key, diffVal);
+      diffs.set(normalizeRequirementId(curr.id), diffVal);
     } else {
-      diffs.set(key, {
+      const diffVal: RequirementDiff = {
         id: curr.id,
         classification: 'IN_SYNC',
         changedFields: []
-      });
+      };
+      diffs.set(key, diffVal);
+      diffs.set(normalizeRequirementId(curr.id), diffVal);
     }
   }
 
   // ── Unmatched current requirements → ADD ────────────────────────────────────
   for (const cIdx of currUnmatched) {
     const curr = currReqs[cIdx];
-    diffs.set(curr.fingerprint, {
+    const diffVal: RequirementDiff = {
       id: curr.id,
       classification: 'ADD',
       changedFields: [
         { field: 'Requirement', oldVal: '', newVal: curr.description }
       ]
-    });
+    };
+    diffs.set(curr.fingerprint, diffVal);
+    diffs.set(normalizeRequirementId(curr.id), diffVal);
   }
 
 
@@ -290,29 +317,77 @@ export function detectDeletedRequirementOrphans(
     return false;
   };
 
+  const isFileImportedByOthers = (filePath: string): boolean => {
+    const baseName = path.basename(filePath, '.spec.ts');
+    const allFiles = Array.from(new Set(tests.map(t => t.filePath)));
+    for (const f of allFiles) {
+      if (f === filePath) continue;
+      try {
+        if (fs.existsSync(f)) {
+          const content = fs.readFileSync(f, 'utf-8');
+          if (content.includes(baseName)) {
+            return true;
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return false;
+  };
+
   for (const test of tests) {
     const isTestActive = activeTests.has(testKey(test));
 
     if (!isTestActive) {
       // Unmapped Test -> Orphan Test
-      // Suggest removing the entire test case
-      suggestions.push({
-        requirementId: test.requirementId || 'UNMAPPED',
-        action: 'REMOVE',
-        title: `Orphan test: ${test.title}`,
-        testTitle: test.title,
-        implementationSummary: `"${test.title}" in ${path.basename(test.filePath)}`,
-        description:
-          `• Affected file: ${path.basename(test.filePath)}\n` +
-          `• Test: "${test.title}"\n` +
-          `• Reason: This test does not map to any active requirement in the Requirement Document. The entire test case will be removed.`,
-        filePath: test.filePath,
-        startLine: test.startLine,
-        endLine: test.endLine,
-        originalCode: test.fullText,
-        classification: 'ORPHAN',
-        codeChangesRequired: 'Yes'
-      });
+      const allTestsInFile = tests.filter(t => t.filePath === test.filePath);
+      const activeTestsInFile = allTestsInFile.filter(t => activeTests.has(testKey(t)));
+      const isShared = isFileImportedByOthers(test.filePath);
+
+      if (activeTestsInFile.length === 0 && !isShared) {
+        let originalContent = '';
+        try {
+          if (fs.existsSync(test.filePath)) {
+            originalContent = fs.readFileSync(test.filePath, 'utf-8');
+          }
+        } catch {}
+
+        suggestions.push({
+          requirementId: test.requirementId || 'UNMAPPED',
+          action: 'REMOVE',
+          title: `Delete empty spec file: ${path.basename(test.filePath)}`,
+          testTitle: test.title,
+          implementationSummary: `"${test.title}" in ${path.basename(test.filePath)}`,
+          description:
+            `• Affected file: ${path.basename(test.filePath)}\n` +
+            `• Reason: This file contains no active tests mapping to requirements. The entire spec file will be deleted.`,
+          filePath: test.filePath,
+          originalCode: originalContent,
+          deleteFile: true,
+          classification: 'ORPHAN',
+          codeChangesRequired: 'Yes'
+        });
+      } else {
+        suggestions.push({
+          requirementId: test.requirementId || 'UNMAPPED',
+          action: 'REMOVE',
+          title: `Orphan test: ${test.title}`,
+          testTitle: test.title,
+          implementationSummary: `"${test.title}" in ${path.basename(test.filePath)}`,
+          description:
+            `• Affected file: ${path.basename(test.filePath)}\n` +
+            `• Test: "${test.title}"\n` +
+            `• Reason: This test does not map to any active requirement in the Requirement Document. The entire test case will be removed.`,
+          filePath: test.filePath,
+          startLine: test.startLine,
+          endLine: test.endLine,
+          originalCode: test.fullText,
+          deleteFile: false,
+          classification: 'ORPHAN',
+          codeChangesRequired: 'Yes'
+        });
+      }
     } else if (test.requirementBlocks && test.requirementBlocks.length > 0) {
       // Mapped Test -> Check for individual orphan blocks
       const orphanIds = Array.from(new Set(
@@ -660,7 +735,10 @@ export async function analyzeCoverage(
 
     // Validate / Override classification based on local atomic coverage
     const localCoverage = atomicCoverageReport.results.find((r: any) => normalizeRequirementId(r.reqId) === normalizeRequirementId(req.id));
-    if (localCoverage && localCoverage.missingCount === 0 && matchedTest) {
+    const diff = reqDiffs.get(req.fingerprint);
+    const hasDocChanges = diff && diff.classification !== 'IN_SYNC';
+
+    if (localCoverage && localCoverage.missingCount === 0 && matchedTest && !hasDocChanges) {
       if (clone.action === 'MODIFY' || clone.action === 'ADD') {
         if (isVerbose) {
           console.log(`   ⚙️ Local override: [${req.id}] has complete executable coverage. Overriding action to NONE.`);
@@ -1703,29 +1781,107 @@ export function buildUserAnalysisPrompt(
     "      - Identify only the SPECIFIC lines of the existing test body that need to change.\n" +
     "      - Do NOT regenerate the entire test function, describe block, imports, or helpers.\n" +
     "      - If only one assertion is missing, output only that one assertion.\n" +
+    "    STEP 1a — EXECUTION FLOW ANALYSIS (MANDATORY for all MODIFY / SCOPE C patches):\n" +
+    "      Before writing a single line of patch code, you MUST trace the complete execution flow of the\n" +
+    "      existing test from top to bottom and build an ordered map of every step:\n" +
+    "      FLOW MAP FORMAT (internal — do not output this; use it to determine the insertion point):\n" +
+    "        Line N: <action/assertion> → <page/state produced>\n" +
+    "        Line N+1: <action/assertion> → <page/state produced>\n" +
+    "        ...\n" +
+    "      INSERTION POINT RULE (CRITICAL — violation will cause wrong test behavior):\n" +
+    "        - For each missing atomic check [Ax], identify the EXACT action already in the test that\n" +
+    "          produces the page/state that [Ax] needs to verify.\n" +
+    "        - The patch line(s) for [Ax] MUST be inserted IMMEDIATELY AFTER that action — not at the\n" +
+    "          end of the test, not before it, not in an arbitrary position.\n" +
+    "        - Example: If [Ax] asserts that a product title is visible after clicking the product card,\n" +
+    "          find the .click() on the product card in the flow map and insert the assertion on the\n" +
+    "          very next line after it.\n" +
+    "        - Example: If [Ax] asserts the cart page URL after navigation, find the page.goto('/cart')\n" +
+    "          or the cart button click and insert the toHaveURL assertion directly after it.\n" +
+    "      FORBIDDEN PLACEMENTS:\n" +
+    "        ✗ Appending assertions at the end of the test when the relevant action appears earlier.\n" +
+    "        ✗ Inserting before the action that produces the state being asserted.\n" +
+    "        ✗ Grouping all missing assertions at a single arbitrary location in the test body.\n" +
+    "        ✗ Inserting inside a different test block or outside the matched test scope.\n" +
+    "      CONTEXT LINE RULE: The PATCH_DIFF must include 2–3 unchanged lines immediately before and\n" +
+    "      after the insertion point so the diff anchors precisely to the correct location in the file.\n" +
     "    STEP 2 — ASSERTION SELECTION:\n" +
     "      - Choose the most precise official Playwright assertion for each atomic check:\n" +
     "          toBeVisible() / toHaveText() / toHaveURL() / toBeEnabled() / toHaveValue()\n" +
     "          toBeChecked() / toHaveCount() / toHaveAttribute() / toContainText()\n" +
     "      - Do NOT invent non-existent Playwright APIs.\n" +
     "      - Ensure every line compiles without TypeScript errors.\n" +
-    "    STEP 3 — DUPLICATION CHECK:\n" +
-    "      - Confirm the generated lines are NOT already present in the existing test code.\n" +
-    "      - Do NOT duplicate imports, helper functions, describe blocks, variables, or test cases.\n" +
+    "    STEP 2a — SCOPE INVENTORY (MANDATORY — build this before writing any patch line):\n" +
+    "      Read the ENTIRE matched test file from top to bottom and catalogue:\n" +
+    "      INVENTORY A — IMPORTS: every symbol already imported at the top of the file.\n" +
+    "      INVENTORY B — DECLARATIONS: every const/let/var name declared in the test body,\n" +
+    "        describe block, module scope, loop variables, and catch parameters.\n" +
+    "      INVENTORY C — LOCATOR REFERENCES: every locator key expression already used in\n" +
+    "        the test body (e.g. theSouledStoreLocators.nav.wishlistIcon).\n" +
+    "      INVENTORY D — HELPERS: every helper function already called or defined in the file.\n" +
+    "      REUSE RULE (applies to every line of patch code generated after this step):\n" +
+    "        - Symbol in INVENTORY A  → import already exists. Do NOT add another import for it.\n" +
+    "        - Name in INVENTORY B    → variable already declared. Do NOT use const/let for it.\n" +
+    "          Reference the existing variable directly. If you need a different value, use a new name.\n" +
+    "        - Key in INVENTORY C     → locator already referenced. Do NOT add it to LOCATOR_UPDATES.\n" +
+    "          Reuse the existing reference directly.\n" +
+    "        - Helper in INVENTORY D  → already available. Do NOT redefine or reimport it.\n" +
+    "      NAME CONFLICT RULE: If the patch needs a new variable whose name matches any entry in\n" +
+    "        INVENTORY B, choose a distinct name before writing the patch line.\n" +
+    "        FORBIDDEN: Reusing a name from INVENTORY B as a new const/let/var identifier.\n" +
+    "    STEP 3 — DUPLICATION CHECK (cross-reference STEP 2a inventories before output):\n" +
+    "      - Every import in the patch must NOT be in INVENTORY A. If it is, remove it from the patch.\n" +
+    "      - Every const/let/var name in the patch must NOT be in INVENTORY B. If it is, reuse or rename.\n" +
+    "      - Every locator key in the patch must NOT already be in INVENTORY C as an existing reference.\n" +
+    "      - Every helper call in the patch must NOT be a duplicate of INVENTORY D.\n" +
+    "      - No existing assertion from the current test may be re-emitted unchanged in the patch.\n" +
     "    STEP 4 — STYLE CHECK:\n" +
     "      - Match the indentation, spacing, quote style, and naming conventions of the existing file.\n" +
     "    STEP 5 — COMPILE VALIDATION:\n" +
-    "      - Before outputting, mentally verify the TypeScript is syntactically correct.\n" +
-    "      - Check that all variables referenced in the patch are already declared or declared in the patch.\n" +
-    "      - Check that no duplicate variable declarations (let, const) are introduced.\n" +
+    "      - Before outputting, check every identifier in the patch against INVENTORY B.\n" +
+    "        If it is already declared → the patch must USE (not re-declare) it. A second const/let\n" +
+    "        for the same name is a TypeScript TS2300 / TS2451 compile error.\n" +
+    "      - Check every import in the patch against INVENTORY A. If it is already imported → omit\n" +
+    "        the import line from the patch entirely.\n" +
+    "      - Check that all other variables referenced are either already in INVENTORY B or declared\n" +
+    "        with a fresh name (not in INVENTORY B) within the patch itself.\n" +
     "    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
     "    OUTPUT RULES:\n" +
     "      - Generate code only for MODIFY and ADD.\n" +
     "      - For MODIFY (SCOPE C — inline patch): Output ONLY the minimal missing lines as PATCH_DIFF + raw PROPOSED_CODE. Do NOT include unchanged surrounding code. If two consecutive atomic checks share the same parent locator variable, declare it once and reference it in both.\n" +
-    "      - For ADD (SCOPE A — new file): A new .spec.ts file is needed. Output full file: imports + test.describe block + module-scope helpers + test() block + all assertions. Do NOT copy imports or helpers not used by this specific test.\n" +
-    "      - For ADD (SCOPE B — new test block in existing file): Output only the new test('...', async ({ page }) => { ... }) block. DO NOT re-emit existing imports, describe wrappers, or helpers already present in the file. The new block must rely only on already-existing file-level helpers.\n" +
-    "      - SCOPE DECISION RULE: Use SCOPE A only when no spec file exists for this feature area. Use SCOPE B when a spec file exists but has no test block for this requirement. Use SCOPE C for all MODIFY cases.\n" +
-    "      - If you cannot generate a complete implementation with high confidence, set CLASSIFICATION to MODIFY or ADD, explain what is missing in the REASON field, and set PROPOSED_CODE to: 'LOW_CONFIDENCE — <explain missing info>'.\n" +
+    "      - PLACEMENT RULE (MANDATORY for SCOPE C): Each missing assertion MUST be placed at the\n" +
+    "        logically correct position identified in STEP 1a — immediately after the action that\n" +
+    "        produces the state being verified. NEVER append missing assertions at the end of the\n" +
+    "        test by default. If multiple assertions are missing, each one must be placed after its\n" +
+    "        own triggering action, preserving the correct semantic execution order.\n" +
+    "      - For ADD (SCOPE A — new file):\n" +
+    "          COMPLETENESS MANDATE: Before writing a single line, decompose EVERY atomic statement\n" +
+    "          of the requirement [A1]..[AN]. The generated file must satisfy ALL of them in one pass.\n" +
+    "          Output: imports + test.describe block + module-scope helpers + test() block + every\n" +
+    "          assertion and action required by every atomic check.\n" +
+    "          Do NOT copy imports or helpers not used by this specific test.\n" +
+    "          FORBIDDEN: Generating a stub or skeleton that covers only the first atomic.\n" +
+    "          FORBIDDEN: Writing a minimum viable test that will require a MODIFY on the next run.\n" +
+    "      - For ADD (SCOPE B — new test block in existing file):\n" +
+    "          COMPLETENESS MANDATE: Before writing a single line, decompose EVERY atomic statement\n" +
+    "          of the requirement [A1]..[AN]. The test() block must satisfy ALL of them in one pass.\n" +
+    "          Output: ONLY the new test('...', async ({ page }) => { ... }) block.\n" +
+    "          Do NOT re-emit existing imports, describe wrappers, or helpers already in the file.\n" +
+    "          The new block must rely only on already-existing file-level helpers.\n" +
+    "          FORBIDDEN: Generating a stub or skeleton that covers only the first atomic.\n" +
+    "          FORBIDDEN: Writing a minimum viable test that will require a MODIFY on the next run.\n" +
+    "      - ADD SELF-REVIEW (MANDATORY — run after generating ADD code, before returning output):\n" +
+    "          For each atomic check [Ax] of the requirement, locate the EXACT Playwright line in the\n" +
+    "          generated code that satisfies it. If any [Ax] has no satisfying line — add it now.\n" +
+    "          Only return the code after every [Ax] has a named satisfying line.\n" +
+    "          A requirement implemented through ADD must not require another MODIFY on the next run\n" +
+    "          unless the Requirement Document itself changes.\n" +
+    "      - SCOPE DECISION RULE: Use SCOPE A only when no spec file exists for this feature area.\n" +
+    "        Use SCOPE B when a spec file exists but has no test block for this requirement.\n" +
+    "        Use SCOPE C for all MODIFY cases.\n" +
+    "      - If you cannot generate a complete implementation with high confidence, set CLASSIFICATION\n" +
+    "        to MODIFY or ADD, explain what is missing in the REASON field, and set PROPOSED_CODE to:\n" +
+    "        'LOW_CONFIDENCE — <explain missing info>'.\n" +
     "      - Never generate code for REVIEW or IN_SYNC.\n" +
     "    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
     "    UNIFIED DIFF FORMAT (mandatory for all MODIFY patches):\n" +
@@ -1735,8 +1891,13 @@ export function buildUserAnalysisPrompt(
     "           (context lines with a leading space)\n" +
     "          -<removed line>\n" +
     "          +<added line>\n" +
-    "      - Include 2–3 lines of unchanged context above and below each change block.\n" +
-    "      - Then include WHY_NEEDED: <one sentence explaining which atomic check this satisfies>.\n" +
+    "      - Include 2–3 lines of unchanged context above and below each change block. These\n" +
+    "        context lines MUST be the lines immediately surrounding the insertion point\n" +
+    "        determined in STEP 1a — not arbitrary lines from elsewhere in the test.\n" +
+    "      - Then include WHY_NEEDED: <one sentence stating which atomic check [Ax] this satisfies\n" +
+    "        AND why this specific line in the test is the correct insertion point based on the\n" +
+    "        execution flow (e.g. 'inserted after the .click() that navigates to the PDP because\n" +
+    "        [A3] requires verifying the product title is visible on that page').>\n" +
     "      - The full content (compilable patch) goes under PROPOSED_CODE as usual.\n\n" +
     "D7. Critical Guidelines:\n" +
     "    - The Requirement Document is the only source of truth.\n" +
@@ -2553,6 +2714,23 @@ function parseAndHydrateSuggestions(
     }
   }
 
+  // ── Post-processing: Enforce deterministic classifications ────────────────
+  for (const s of updatedSuggestions) {
+    const normId = normalizeRequirementId(s.requirementId);
+    const diff = reqDiffs.get(normId);
+
+    if (diff && diff.classification !== 'IN_SYNC') {
+      s.classification = diff.classification;
+      if (diff.classification === 'MODIFY') {
+        s.action = 'MODIFY';
+      } else if (diff.classification === 'ADD') {
+        s.action = 'ADD';
+      } else if (diff.classification === 'REVIEW') {
+        s.action = 'NONE';
+      }
+    }
+  }
+
   return updatedSuggestions;
 }
 
@@ -2745,7 +2923,7 @@ async function analyzeWithGemini(
     "  - Do NOT redefine any helper already in CATALOGUE 2 or CATALOGUE 9. Reuse it by name (e.g., if dismissMembershipPopup already exists in tests/helpers/dismissPopup.ts, reuse/import it).",
     "  - Do NOT duplicate any test title already in CATALOGUE 5.",
     "  - Do NOT reference any locator key not in CATALOGUE 4 unless it was first added to LOCATOR_UPDATES.",
-    "  - Never assume browser globals (e.g. window, document, alert) or DOM APIs exist. Do not use them.",
+    "  - FORBIDDEN BROWSER GLOBALS: Never use window, document, HTMLElement, querySelector, or other browser globals directly in Playwright test files. These globals are only valid inside page.evaluate(). All DOM interactions must use Playwright APIs (page.locator(), getByRole(), getByText(), etc.). Generated code must compile under Node.js without requiring DOM libraries.",
     "  - Never use external libraries or APIs that are not defined in package.json or supported by tsconfig.json.",
     "  - Adapt generated code to the project's configuration (tsconfig, package.json dependencies, target language options, existing directory structures) rather than expecting the project to adapt to the generated code.",
     "Only after completing this catalogue pass, proceed to Stage 1.",
@@ -2763,8 +2941,9 @@ async function analyzeWithGemini(
     "    Expected Result: maps to the expected outcome.",
     "    Title: maps to the test scope and mapping.",
     "- If a Goal, Title, or Expected Result changes, determine whether the existing test still satisfies the new intent.",
-    "- If the change affects executable behavior (e.g. changes requirements, steps, actions, or expected assertions): classify as MODIFY and suggest the minimal code changes.",
-    "- If only documentation, descriptions, goals, or naming changed (i.e. existing test code execution still fully satisfies the new intent): classify as REVIEW and explain why no code change is required.",
+    "- REVIEW : Only documentation changed (Goal, Expected Result, headings, numbering, formatting, grammar, or wording that does not change behavior). Never classify the addition, removal, or modification of executable requirements as REVIEW.",
+    "- IN_SYNC : The existing test fully satisfies the latest Requirement Document, and there is no obsolete, extra, or removed step implementation in the test. If any step was removed from the Requirement Document, the corresponding code in the test is now obsolete/extra, so it is NOT in sync and must be classified as MODIFY.",
+    "- MODIFY : One or more executable atomic requirements are added, removed, or changed, causing the test to have missing, incorrect, or extra/obsolete behavior. If an executable requirement step is removed from the Requirement Document but the corresponding implementation still exists in the test, it MUST be classified as MODIFY, not REVIEW or IN_SYNC, and you must suggest a patch to delete/remove that obsolete code. Any addition, removal, or modification of the Requirement field is an executable change and MUST be classified as MODIFY (or ADD/DELETED), NEVER as REVIEW.",
     "- Never ignore or skip any change, regardless of how small it is.",
     "",
     "═══ ANALYSIS METHODOLOGY: INDIVIDUAL REQUIREMENT LEVEL ═══",
@@ -2797,34 +2976,33 @@ async function analyzeWithGemini(
     "- If any atomic check has no corresponding executable coverage (either direct or cumulative), report it by its label ('[A3] missing') and classify as MODIFY.",
     "",
     "Stage 3 – Per-Requirement Executable Coverage Check (Mandatory)",
-    "- Using the atomic checks [A1]...[AN] from Stage 2, scan the matched test code line-by-line.",
-    "- For each atomic check, find the specific Playwright line or lines that cover it.",
-    "- A requirement is covered if there is a specific expect(...) assertion, Playwright action, or sequence of executable lines that directly validates it.",
-    "- If any atomic check has no corresponding executable Playwright line or cumulative action/assertion, report it as a difference.",
-    "FORBIDDEN — these do NOT count as coverage:",
-    "  ✗ The test navigates to the same page",
-    "  ✗ The test file covers the same feature",
-    "  ✗ A similar requirement is tested",
-    "  ✗ The test title or a comment mentions this requirement",
-    "  ✗ The requirement is semantically similar to a covered one",
-    "  ✗ The same scenario is exercised at a higher level",
+    "- Always analyze the requirement and the entire test semantically before generating any ADD, MODIFY, or PATCH suggestion.",
+    "- Analyze the complete test before suggesting any code changes. Consider all existing interactions, helper methods, reusable functions, assertions, and previously implemented logic.",
+    "- Before marking any atomic requirement as MISSING, analyze the complete execution flow of the existing test.",
+    "- Determine coverage based on the overall implemented behavior, not only on the presence or absence of explicit assertions or exact text matches. Prefer behavioral evidence over syntactic or textual similarity.",
+    "- Treat an atomic requirement as COVERED if the existing implementation already demonstrates the required behavior through valid interactions, verifications, or subsequent successful execution.",
+    "- Only classify an atomic requirement as MISSING when there is no existing implementation that satisfies its intended behavior.",
+    "- Never suggest code that duplicates existing behavior, even if it is implemented differently or located elsewhere in the test. Never generate redundant suggestions for behavior that is already implemented.",
+    "- Double check every suggestion before returning. If a line of code or assertion/interaction (such as expect(...) or click()) is already present in the existing test implementation, you MUST mark the corresponding atomic requirement as COVERED. Never suggest a patch that duplicates, repeats, or re-inserts existing test lines or equivalent behavior.",
+    "- Generate ADD, MODIFY, or PATCH suggestions only for behavior that is genuinely missing after semantic analysis of the complete implementation.",
+    "- If multiple implementations satisfy the same requirement, treat the requirement as COVERED and do not suggest an alternative implementation solely because it differs in structure or assertions.",
+    "- Evaluate coverage based on the final observable behavior of the test, not on implementation style, statement order, variable names, or exact assertion patterns.",
     "Do NOT report as differences (setup/prerequisites — not business requirements):",
     "  * Initial website navigation or base URL navigation.",
     "  * Intermediate user actions required to reach the target state or page.",
     "  * Locating or selecting elements as a prerequisite action.",
     "  * Visual setup, popups/overlay dismissal helpers, or page hydration/settling delays.",
-    "  * Note: Do NOT ignore any wording variations or typos; detect every word-level, line-level and token-level change no matter how small.",
     "",
     "Stage 4 – Impact Analysis",
     "- State explicitly: does the existing test behavior satisfy every atomic check of this requirement?",
     "- If any atomic check [Ax] is absent from the test, the behavior does NOT satisfy the requirement.",
     "",
     "Stage 5 – Classification (atomic check level)",
-    "- IN_SYNC : Every atomic check [A1]…[AN] has a corresponding explicit Playwright line in the test. Wording, formatting, and spelling must match exactly.",
-    "- REVIEW  : Differences detected (e.g. extra test steps from deleted requirement lines), but the executable Playwright behavior still satisfies every atomic check. Report every difference. No code changes needed.",
-    "- MODIFY  : (a) One or more atomic checks [Ax] have no corresponding Playwright assertion/action, OR (b) a test exists for the feature but does NOT contain Playwright logic covering every atomic check of this individual requirement. Specify the exact missing atomic check label and required code.",
+    "- IN_SYNC : The existing test fully satisfies the latest Requirement Document, and there is no obsolete, extra, or removed step implementation in the test. If any step was removed from the Requirement Document, the corresponding code in the test is now obsolete/extra, so it is NOT in sync and must be classified as MODIFY.",
+    "- REVIEW  : Only documentation changed (Goal, Expected Result, headings, numbering, formatting, grammar, or wording that does not change behavior). Never classify the addition, removal, or modification of executable requirements as REVIEW. No code changes needed.",
+    "- MODIFY  : One or more executable atomic requirements are added, removed, or changed, causing the test to have missing, incorrect, or extra/obsolete behavior (e.g. if an executable requirement step is removed from the Requirement Document but the corresponding implementation still exists in the test). Classify as MODIFY, not REVIEW or IN_SYNC. Suggest a patch to delete/remove the obsolete lines of code related to the removed step, preserving all unrelated code.",
     "- ADD     : This specific requirement has no matching test block at all.",
-    "- DELETED : The requirement ID is in the DELETED REQUIREMENT IDS list. Action must be REMOVE.",
+    "- DELETE  : The entire requirement is removed from the Requirement Document (or the requirement ID is in the DELETED REQUIREMENT IDS list. Action must be REMOVE). Only classify as DELETE when the entire requirement is removed from the Requirement Document.",
     "",
     "Stage 6 – Code Generation",
     "STRICT GENERATION SCOPE RULES (MANDATORY — check the MANDATORY GENERATION SCOPE and TARGET FILE fields for each requirement):",
@@ -2836,16 +3014,39 @@ async function analyzeWithGemini(
     "  - Never generate only a snippet when a complete test or new file is required.",
     "  - Reuse existing imports, describe blocks, helpers, and fixtures whenever possible. Generate only the minimum code required while keeping it production-ready.",
     "  - If two consecutive atomic checks share the same parent locator variable, declare it once only.",
+    "  - Never invent extra, unrequired assertions (e.g., asserting URL transitions like toHaveURL(/.*search.*/) or toHaveURL(/.*product.*/) after search/form submissions or link clicks) unless the requirement explicitly mandates a URL verification. Verify requirement coverage by asserting actual page content (e.g., product/element visibility) rather than fragile URL patterns that may fail due to redirects, SPA updates, hydration delays, or direct page loading.",
+    "  - MODIFY/PATCH GENERATION RULES (CRITICAL — applies to all MODIFY/PATCH suggestions):",
+    "    - Before generating any patch, you MUST analyze the existing test in detail.",
+    "    - Generate ONLY the missing code required to satisfy the uncovered atomic requirements.",
+    "    - Reuse existing variables, locators, actions, and assertions.",
+    "    - Never redeclare existing variables (e.g. const or let that are already defined in the test).",
+    "    - Never repeat existing actions (e.g. if the test already clicked a button or navigated to a page, do not do it again).",
+    "    - Never insert code before a variable is declared (ensure you only reference variables after their declaration line).",
+    "    - Preserve execution order and variable scope.",
+    "    - Return the smallest valid patch that compiles and satisfies only the missing requirement.",
     "",
-    "For all scopes, generate TWO distinct, fully compilable, production-ready options:",
-    "  Option 1 = standard web-first assertions / primary selectors.",
-    "  Option 2 = alternative selectors / sub-container approach / different API surface.",
-    "  NEVER output a simplified, incomplete, or placeholder Option 2. Both options must be of equal quality.",
+    "═══ SPECIAL CASE: REQUIREMENT STEP REMOVAL RULES ═══",
+    "  - If you are analyzing a requirement change where one or more executable requirement steps/lines have been removed or deleted compared to the previous cached baseline version:",
+    "    - You MUST generate only ONE implementation option (Option 1). Do NOT generate Option 2 or any alternative implementation (set Option 2 fields like PROPOSED_CODE_OPT2, PATCH_DIFF_OPT2, WHY_NEEDED_OPT2 to 'None').",
+    "    - The suggestion must focus exclusively on removing/deleting the obsolete implementation related to the removed requirement step from the test file. The proposed patch should represent a deletion block.",
+    "    - Preserve all unrelated code, test steps, assertions, helpers, and functionality exactly as they are.",
+    "    - Do NOT refactor, regenerate, or optimize the test. The change must be minimal, conflict-free, and limited strictly to deleting the obsolete lines of code.",
+    "  - For all other scenarios (new requirement additions, new assertions/actions added, modifications/updates to values, improvements, etc.), you MUST continue to generate exactly two distinct implementation options (Option 1 and Option 2) as normal:",
+    "    - Both options must satisfy the same uncovered executable requirement but use different valid implementation approaches.",
+    "    - Do not suppress the second option simply because the first option already satisfies the requirement.",
+    "    - Both options must avoid duplicating existing behavior already implemented in the test.",
+    "    - If no executable requirement is missing, generate no suggestions. Otherwise, generate exactly two non-duplicate implementation options for the missing behavior.",
+    "    - The two options must be functionally equivalent but implementation-wise different (e.g., different verification strategy, locator strategy, or assertion strategy), while both remaining valid within the project standards.",
+    "    - Option 1 = standard web-first assertions / primary selectors.",
+    "    - Option 2 = alternative selectors / sub-container approach / different API surface.",
+    "    - NEVER output a simplified, incomplete, or placeholder Option 2. Both options must be of equal quality.",
     "Before writing any code, run this checklist IN ORDER:",
     "  STEP 0 — LOCATOR CHECK: Look up every locator the patch uses in ALL EXISTING LOCATOR KEYS.",
-    "    If the locator EXISTS → use the existing key. Do NOT add a duplicate.",
-    "    If the locator is MISSING → emit a separate LOCATOR_UPDATES entry BEFORE the test patch.",
-    "    Never reference a locator that is not defined in the locator file.",
+    "    - Never generate hardcoded locators inside test code. Always use existing locators from the project's locator files.",
+    "    - If a required locator does not exist, suggest adding it to the locator file (via LOCATOR_UPDATES) and reference it from there.",
+    "    - Do not generate CSS selectors, XPath, text selectors, or role selectors directly inside tests unless the project already follows that pattern.",
+    "    - If the locator EXISTS → use the existing key. Do NOT add a duplicate.",
+    "    - Never reference a locator that is not defined in the locator file.",
     "  F16 — NO VARIABLE OR IMPORT REDECLARATIONS: Before declaring any variable (const, let), scan EXISTING TEST CODE. Before adding any import statement, scan ALL existing import lines at the top of the file. FORBIDDEN: re-adding any import that already exists in the file. FORBIDDEN: redeclaring any variable already in scope. Reuse the existing symbol.",
     "  STEP 1 — PATCH SCOPE: Identify only the exact lines that are missing. Do NOT regenerate the",
     "    entire test function, describe block, imports, or helpers. Output only the missing lines.",
@@ -2858,25 +3059,61 @@ async function analyzeWithGemini(
     "  STEP 4 — STYLE: Match the exact indentation, quote style, and naming of the existing file.",
     "  STEP 5 — COMPILE CHECK: Mentally verify that the TypeScript is syntactically correct.",
     "    All variables used must be declared. No duplicate let/const declarations.",
-    "  STEP 6 — PROJECT AWARENESS: Verify that no browser globals (e.g. window, document), DOM APIs, or external dependencies are assumed. Ensure all referenced helpers, page objects, configurations, and imports exist in the project catalogue or are generated.",
+    "  STEP 6 — PROJECT AWARENESS: Verify that no browser globals (e.g. window, document, HTMLElement, querySelector, DOM APIs) are used outside of page.evaluate(). Ensure all generated code compiles cleanly under Node.js without requiring DOM/browser libraries, and that all referenced helpers, page objects, configurations, and imports exist in the project catalogue.",
     "OUTPUT for MODIFY (always SCOPE C): Output ONLY the missing assertions/actions for each uncovered [Ax]. Follow SCOPE C rules above — no surrounding unchanged code.",
-    "OUTPUT for ADD: Follow the SCOPE DECISION TREE above. SCOPE A = full new file (imports + describe + helpers + test()). SCOPE B = new test() block ONLY (no imports, no describe wrapper, no helpers that already exist in the file).",
+    "OUTPUT for MODIFY (always SCOPE C): Output ONLY the missing assertions/actions for each uncovered [Ax]. Follow SCOPE C rules above — no surrounding unchanged code.",
+    "OUTPUT for ADD: Follow the SCOPE DECISION TREE above.",
+    "  SCOPE A = full new file (imports + describe + helpers + test()).",
+    "  SCOPE B = new test() block ONLY (no imports, no describe wrapper, no helpers that already exist in the file).",
+    "",
+    "ADD COMPLETENESS MANDATE (CRITICAL — applies to every ADD regardless of scope):",
+    "  - You MUST ensure BOTH generated options (Option 1 and Option 2) fully implement all actions, assertions, and verifications for all atomic checks [A1]..[AN].",
+    "  - Every assertion and check must be evaluated with the exact same strictness during test generation (first run) as in coverage analysis (subsequent runs). If any assertion/verification (such as relevance, active status, success message, or state confirmation) would be considered 'MISSING' in a second-run analysis, it MUST be fully implemented in BOTH Option 1 and Option 2 in the first run.",
+    "  - Do not omit, skip, or simplify any verification/assertion in either option, so that whichever option is selected, the test satisfies all requirements in the first run and never shows as 'assertion missing' in subsequent runs.",
+    "  - Specifically, if a requirement specifies that the system displays products 'relevant' or 'matching' a query, both options MUST include robust assertions validating the relevance of the results (e.g. verifying the search result text contains/matches the search keyword, not just that a product element is visible).",
+    "  - Both options must satisfy the completeness guarantee: no further MODIFY or PATCH should be needed on subsequent runs.",
+    "  STEP A1 — REQUIREMENT DECOMPOSITION: Before writing any code, list every atomic statement",
+    "    of the requirement as [A1]..[AN]. Every atomic must produce at least one Playwright line.",
+    "  STEP A2 — FULL IMPLEMENTATION: Write two complete implementations (Option 1 and Option 2) that both satisfy ALL",
+    "    [A1]..[AN] atomics. Do not implement a subset in either option and rely on a future MODIFY to add the rest.",
+    "  STEP A3 — NO STUBS OR SKELETONS: The generated code for both options must be production-ready and immediately",
+    "    executable. Every action and assertion required by the requirement must be present in both options.",
+    "    FORBIDDEN: Placeholder comments such as '// TODO: add assertion for Ax' in either option.",
+    "    FORBIDDEN: Generating only navigation steps and omitting the assertions they lead to in either option.",
+    "    FORBIDDEN: Returning code that covers [A1] but leaves [A2]..[AN] for a follow-up MODIFY in either option.",
+    "  STEP A4 — SELF-REVIEW (MANDATORY before returning any ADD output): After generating the code for Option 1 and Option 2,",
+    "    go through each [Ax] and confirm which exact Playwright line in each option satisfies it:",
+    "      [A1] → Option 1 line: <line>, Option 2 line: <line>",
+    "      [A2] → Option 1 line: <line>, Option 2 line: <line>",
+    "      ...",
+    "    If any [Ax] has no satisfying line in either option — add the missing code/assertion to that option before returning.",
+    "    Only return the final code after 100% atomic coverage in both options is confirmed.",
+    "  GUARANTEE: A requirement implemented through ADD must not require another MODIFY/PATCH on",
+    "    the next run unless the Requirement Document itself changes.",
     "Never generate code for REVIEW or IN_SYNC.",
     "UNIFIED DIFF (mandatory for MODIFY): output a PATCH_DIFF block in standard unified diff format",
     "  @@ -N,M +N,M @@ with 2-3 lines of context, then WHY_NEEDED: <which [Ax] this fixes>.",
     "",
     "═══ NEWLY ADDED AND MODIFIED REQUIREMENT DETECTION ═══",
-    "- Read the complete Requirement Document word-by-word, line-by-line, and statement-by-statement before starting the comparison.",
-    "- Detect every added, removed, or modified word, token, sentence, line, or section (Title, Goal, Requirement, Expected Result), even if only a single character or word changes.",
-    "- If a change occurred in a Goal, Title, or Expected Result, determine whether the existing test still satisfies the new intent.",
-    "  - If only documentation, naming, descriptions, goals, or comments changed and the existing executable Playwright code still satisfies the new intent: classify as REVIEW, and suggest updating the comments in the test to match the new wording exactly. Suggest NO code changes.",
-    "  - If the change affects executable behavior (e.g. changes requirements, actions, or expected assertions): classify as MODIFY, and suggest the minimal code changes.",
+    "- Compare requirements strictly at the atomic (line/step) level.",
+    "- Perform a strict word-level comparison for the Title, Goal, Requirements, and Expected Result fields.",
+    "- Detect every added, removed, modified, or reordered word, regardless of how small the change is. No word-level change (such as addition, deletion, modification, or reordering of any word) should be ignored, and every detected change must be reflected in the impact analysis and classification.",
+    "- Detect every addition, removal, or modification, even for a single executable step.",
+    "- Detect even the smallest executable changes and analyze their impact on the existing implementation.",
+    "- When an executable step/requirement is removed from the Requirement Document:",
+    "  - Check whether related implementation/code exists in the test.",
+    "  - If related code exists: classify as MODIFY and suggest removing or updating only that implementation. Preserve all unrelated code and generate changes only for the impacted implementation.",
+    "  - If no related code exists: classify as REVIEW because no implementation is affected (suggest updating comments/documentation only, no code changes).",
+    "- Documentation-only changes (Goal, Expected Result, headings, numbering, formatting, spelling, grammar, etc. that do not change behavior) must always be classified as REVIEW. Never classify the addition, removal, or modification of executable requirements as REVIEW.",
+    "- If any executable atomic requirement is added, removed, or changed, causing the test to have missing, incorrect, or extra/obsolete behavior: classify it as MODIFY and suggest changes targeting only that behavior, preserving all unrelated code.",
+    "- Classification must be based on the final executable behavior, not only text differences. If the updated Requirement Document is already fully satisfied by the existing test implementation and has no extra/obsolete code from deleted requirements, classify it as IN_SYNC. If wording or atomic statements changed without changing the required checks or leaving obsolete code, it is IN_SYNC. If a step was removed, it must be classified as MODIFY (to clean up the obsolete code), never as IN_SYNC.",
     "- Never ignore or skip any change, regardless of how small it is.",
     "- Similar meaning does NOT imply coverage. Detect and report each requirement independently.",
     "- A new requirement related to an existing feature is NOT covered by the existing test for that feature.",
     "- Never assume a requirement is covered because another requirement for the same feature is covered.",
     "",
     "═══ IMPORTANT RULES ═══",
+    "- Generative completeness constraint: All code suggestions (for both ADD and MODIFY actions) must satisfy 100% of the associated requirement's atomic checks in their first generation run. You must include robust, high-fidelity verifications and assertions (e.g. relevance matches, active state checks, success status confirmations) in the generated code so that a subsequent sync run will never report any missing assertions or classify the requirement as MODIFY.",
     "- The Requirement Document is the only source of truth.",
     "- Never invent, restore, or assume missing requirements.",
     "- Never justify IN_SYNC by saying the requirement is implied, similar, or a prerequisite of another.",
@@ -3042,11 +3279,19 @@ async function analyzeWithGemini(
   let detectedChangesSection = '';
   if (reqDiffs.size > 0) {
     const changeLines: string[] = [];
+    const processedIds = new Set<string>();
     for (const diff of reqDiffs.values()) {
+      const normId = normalizeRequirementId(diff.id);
+      if (processedIds.has(normId)) continue;
+      processedIds.add(normId);
+
       if (diff.classification !== 'IN_SYNC') {
         changeLines.push(`[Requirement ID: ${diff.id}]`);
         changeLines.push(formatDetectedChanges(diff));
         changeLines.push(`Suggested classification based on changes: ${diff.classification}`);
+        if (diff.classification === 'MODIFY') {
+          changeLines.push(`Instructions for this requirement: You MUST classify this as MODIFY and generate the corresponding code changes. If this is a step removal, you MUST generate ONLY Option 1 to delete the obsolete implementation, and set Option 2 fields to 'None'.`);
+        }
         changeLines.push('');
       }
     }
@@ -3054,7 +3299,7 @@ async function analyzeWithGemini(
       detectedChangesSection = `═══ DETECTED REQUIREMENT CHANGES (COMPARED TO PREVIOUS SUCCESSFUL RUN) ═══\n` +
         `The local parser has performed an exact comparison with the previous snapshot and detected these changes:\n\n` +
         changeLines.join('\n') + `\n` +
-        `CRITICAL: You MUST use the exact segment changes and suggested classifications above in your analysis. For every changed requirement listed above, output the changed segments under the DETECTED_CHANGES field in your report blocks exactly as shown. Set CLASSIFICATION to the suggested classification (REVIEW for documentation-only changes, MODIFY/ADD/DELETED as indicated).\n\n`;
+        `CRITICAL: You MUST use the exact segment changes and suggested classifications above in your analysis. For every changed requirement listed above, output the changed segments under the DETECTED_CHANGES field in your report blocks exactly as shown. You MUST set the CLASSIFICATION field to the exact suggested classification provided above (e.g. if the suggested classification is MODIFY, you MUST classify it as MODIFY and generate the corresponding code changes - Option 1 only for requirement step removals, or both Option 1 & Option 2 for all other modifications, following the Special Case rules below; if it is REVIEW, you MUST classify it as REVIEW). You are FORBIDDEN from ignoring or overriding this suggested classification.\n\n`;
     }
   }
 

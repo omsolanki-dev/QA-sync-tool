@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as readline from 'readline';
 import { chromium } from '@playwright/test';
 import { findRequirementDocument, extractRequirements, findTestScripts, scanTestFiles, parseTestFileStructure, reconstructTestFile, FileSegment, resolveLocatorsPathForFile, normalizeRequirementId, findConfigFilePath, findLocatorsFilePath, getMissingLocators, Requirement, applyChanges, cleanProposedCode, ensureRequirementComment, updateConfigFile, updateLocatorsFile, updateEnvFile, findExternalDependencies, healSpecImports, Suggestion } from './testScanner';
-import { analyzeCoverage, MappingError } from './aiAnalyzer';
+import { analyzeCoverage, MappingError, currFingerprintToPrevFingerprintMap, currIdToPrevIdMap, compareRequirementDocuments } from './aiAnalyzer';
 
 // Custom ANSI colors for sleek terminal output
 const RESET = '\x1b[0m';
@@ -28,22 +28,22 @@ function printDiff(original?: string, proposed?: string, maxLines = 60): void {
     console.log(DIFF_HEADER);
     const origLines = original.trim().split('\n');
     const propLines = proposed.trim().split('\n');
-    const printLines = (lines: string[], prefix: string, color: string, limit: number) => {
+    const printLines = (lines: string[], color: string, limit: number) => {
       const shown = lines.slice(0, limit);
-      shown.forEach(l => console.log(`${color}${prefix} ${l}${RESET}`));
+      shown.forEach(l => console.log(`${color}    ${l}${RESET}`));
       if (lines.length > limit) {
         console.log(`${DIM}  ... ${lines.length - limit} more lines hidden${RESET}`);
       }
     };
-    printLines(origLines, '-', RED, maxLines);
+    printLines(origLines, RED, maxLines);
     console.log(DIFF_HEADER);
-    printLines(propLines, '+', GREEN, maxLines);
+    printLines(propLines, GREEN, maxLines);
     console.log(DIFF_HEADER);
   } else if (original) {
     console.log(`${BOLD}  🔧 Suggested Patch (Removal):${RESET}`);
     console.log(DIFF_HEADER);
     const origLines = original.trim().split('\n').slice(0, maxLines);
-    origLines.forEach(l => console.log(`${RED}- ${l}${RESET}`));
+    origLines.forEach(l => console.log(`${RED}    ${l}${RESET}`));
     if (original.trim().split('\n').length > maxLines) {
       console.log(`${DIM}  ... more lines hidden${RESET}`);
     }
@@ -52,12 +52,50 @@ function printDiff(original?: string, proposed?: string, maxLines = 60): void {
     console.log(`${BOLD}  ✨ New Code to Add:${RESET}`);
     console.log(DIFF_HEADER);
     const propLines = proposed.trim().split('\n').slice(0, maxLines);
-    propLines.forEach(l => console.log(`${GREEN}+ ${l}${RESET}`));
+    propLines.forEach(l => console.log(`${GREEN}    ${l}${RESET}`));
     if (proposed.trim().split('\n').length > maxLines) {
       console.log(`${DIM}  ... more lines hidden${RESET}`);
     }
     console.log(DIFF_HEADER);
   }
+}
+
+/**
+ * Renders a unified-diff string (patchDiff) as clean TypeScript code.
+ * Rules:
+ *   - @@ hunk headers are skipped entirely — no patch metadata shown.
+ *   - Lines that were additions (originally prefixed '+') → shown in GREEN, no prefix.
+ *   - Lines that were removals (originally prefixed '-') → shown in RED, no prefix.
+ *   - Context lines (originally prefixed ' ') → shown DIM, no prefix.
+ *   - The displayed code is exactly the TypeScript that will be applied.
+ */
+function printCleanCodeDiff(patchDiff: string, maxLines = 80): void {
+  const DIFF_HEADER = `${DIM}${'─'.repeat(56)}${RESET}`;
+  console.log(DIFF_HEADER);
+  let shown = 0;
+  for (const rawLine of patchDiff.split('\n')) {
+    // Skip @@ hunk headers and diff file headers (--- / +++ paths)
+    if (rawLine.startsWith('@@') || rawLine.startsWith('--- ') || rawLine.startsWith('+++ ')) continue;
+
+    if (shown >= maxLines) {
+      console.log(`${DIM}  ... more lines hidden${RESET}`);
+      break;
+    }
+
+    if (rawLine.startsWith('+')) {
+      // Added line — strip the leading '+', display in green
+      console.log(`${GREEN}    ${rawLine.slice(1)}${RESET}`);
+    } else if (rawLine.startsWith('-')) {
+      // Removed line — strip the leading '-', display in red
+      console.log(`${RED}    ${rawLine.slice(1)}${RESET}`);
+    } else {
+      // Context line — strip the leading ' ' if present, display dimmed
+      const content = rawLine.startsWith(' ') ? rawLine.slice(1) : rawLine;
+      console.log(`${DIM}    ${content}${RESET}`);
+    }
+    shown++;
+  }
+  console.log(DIFF_HEADER);
 }
 
 function deduplicateSuggestions(suggestions: Suggestion[]): Suggestion[] {
@@ -117,7 +155,7 @@ function deduplicateSuggestions(suggestions: Suggestion[]): Suggestion[] {
 
 /**
  * Upserts (inserts or replaces) a list of requirements into the cache file.
- * Matching is done by fingerprint (content-based stable identity), NOT by ID.
+ * Matching is done by stable requirement fingerprint (taking edits and renumbering into account).
  * Requirements already in the cache but NOT in `reqs` are left untouched.
  * Never overwrites the entire cache — only touches the specified entries.
  */
@@ -135,11 +173,64 @@ function upsertRequirementsInCache(projectRoot: string, reqs: Requirement[]): vo
     }
   }
 
+  const normLower = (s?: string): string =>
+    (s || '')
+      .replace(/\\'/g, "'")
+      .replace(/\\"/g, '"')
+      .replace(/\\`/g, '`')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+
+  const getCleanTitle = (title: string): string => {
+    return normLower(title).replace(/^(fr|ts|tc|r)-?\d+\s*[:\-]?\s*/, '');
+  };
+
+  // Deduplicate existing cacheRequirements using multi-signal logical checks to prevent duplicates
+  const uniqueCacheReqs: Requirement[] = [];
+  for (const r of cacheRequirements) {
+    const rCleanTitle = getCleanTitle(r.title);
+    const rNormId = normalizeRequirementId(r.id);
+    const duplicateIdx = uniqueCacheReqs.findIndex(ur => 
+      ur.fingerprint === r.fingerprint ||
+      normalizeRequirementId(ur.id) === rNormId ||
+      (rCleanTitle && getCleanTitle(ur.title) === rCleanTitle)
+    );
+    if (duplicateIdx !== -1) {
+      uniqueCacheReqs[duplicateIdx] = r;
+    } else {
+      uniqueCacheReqs.push(r);
+    }
+  }
+  cacheRequirements = uniqueCacheReqs;
+
   for (const req of reqs) {
-    // Use fingerprint as the stable identity key — immune to renumbering/reordering.
-    const idx = cacheRequirements.findIndex(r => r.fingerprint === req.fingerprint);
+    const prevFingerprint = currFingerprintToPrevFingerprintMap.get(req.fingerprint);
+    const prevId = currIdToPrevIdMap.get(normalizeRequirementId(req.id));
+    const reqCleanTitle = getCleanTitle(req.title);
+    const normReqId = normalizeRequirementId(req.id);
+
+    const idx = cacheRequirements.findIndex(r => {
+      // 1. Exact fingerprint match
+      if (r.fingerprint === req.fingerprint) return true;
+
+      // 2. Mapped previous fingerprint match
+      if (prevFingerprint && r.fingerprint === prevFingerprint) return true;
+
+      // 3. Mapped previous ID match
+      if (prevId && normalizeRequirementId(r.id) === prevId) return true;
+
+      // 4. Exact normalized Requirement ID match
+      if (normalizeRequirementId(r.id) === normReqId) return true;
+
+      // 5. Clean title match
+      if (reqCleanTitle && getCleanTitle(r.title) === reqCleanTitle) return true;
+
+      return false;
+    });
+
     if (idx !== -1) {
-      // Requirement content is unchanged — update ID/title in case it was renamed.
+      // Overwrite the existing entry with the new one
       cacheRequirements[idx] = req;
     } else {
       // Genuinely new requirement — append it.
@@ -155,17 +246,22 @@ function upsertRequirementsInCache(projectRoot: string, reqs: Requirement[]): vo
 }
 
 /**
- * Removes a single requirement from the cache by fingerprint.
+ * Removes a single requirement from the cache by fingerprint or requirement ID.
  * Called only when a REMOVE suggestion is approved and the test is actually deleted.
  */
-function removeRequirementFromCache(projectRoot: string, fingerprint: string): void {
+function removeRequirementFromCache(projectRoot: string, fingerprint: string, requirementId?: string): void {
   const cachePath = path.join(projectRoot, '.qa-sync-cache.json');
   if (!fs.existsSync(cachePath)) return;
   try {
     const content = fs.readFileSync(cachePath, 'utf-8').trim();
     if (!content) return;
     let reqs: Requirement[] = JSON.parse(content);
-    reqs = reqs.filter(r => r.fingerprint !== fingerprint);
+    if (requirementId) {
+      const normId = normalizeRequirementId(requirementId);
+      reqs = reqs.filter(r => normalizeRequirementId(r.id) !== normId);
+    } else {
+      reqs = reqs.filter(r => r.fingerprint !== fingerprint);
+    }
     fs.writeFileSync(cachePath, JSON.stringify(reqs, null, 2), 'utf-8');
   } catch (e) {
     // ignore
@@ -177,7 +273,7 @@ function removeRequirementFromCache(projectRoot: string, fingerprint: string): v
  * are successfully applied to disk (never before, never on skip/reject).
  *
  * - ADD / MODIFY: upserts the current requirement entry by fingerprint.
- * - REMOVE: deletes the orphaned requirement from the cache by fingerprint so it
+ * - REMOVE: deletes the orphaned requirement from the cache by requirement ID so it
  *   no longer appears as a baseline on the next run.
  */
 function updateCacheForApprovedSuggestion(
@@ -187,12 +283,8 @@ function updateCacheForApprovedSuggestion(
   prevRequirements: Requirement[]
 ): void {
   if (sug.action === 'REMOVE') {
-    // The orphaned test was deleted. Remove the stale baseline entry from cache.
-    const normId = normalizeRequirementId(sug.requirementId);
-    const orphaned = prevRequirements.find(r => normalizeRequirementId(r.id) === normId);
-    if (orphaned?.fingerprint) {
-      removeRequirementFromCache(projectRoot, orphaned.fingerprint);
-    }
+    // The orphaned test was deleted. Remove the stale baseline entry from cache by requirement ID.
+    removeRequirementFromCache(projectRoot, '', sug.requirementId);
     return;
   }
 
@@ -257,17 +349,24 @@ async function applyAndVerifySuggestion(
   // 3. Apply changes
   try {
     applyChanges(projectRoot, [sug], specFiles, validRequirementIds);
+    if (sug.action === 'REMOVE') {
+      try {
+        updateCacheForApprovedSuggestion(projectRoot, sug, requirements, prevRequirements);
+      } catch (cacheError) {
+        console.error(`⚠️ Failed to update cache for suggestion ${sug.requirementId}:`, cacheError);
+      }
+      return true;
+    }
   } catch (error) {
     console.error(`❌ Failed to apply changes for suggestion ${sug.requirementId}:`, error);
     return false;
   }
 
-  // Update the cache immediately after successfully applying changes to project files,
-  // without waiting for TS compilation, Playwright execution, or verification.
-  try {
-    updateCacheForApprovedSuggestion(projectRoot, sug, requirements, prevRequirements);
-  } catch (cacheError) {
-    console.error(`⚠️ Failed to update cache for suggestion ${sug.requirementId}:`, cacheError);
+
+
+  if (sug.codeChangesRequired === 'No') {
+    console.log(`\n📝 Documentation-only change detected for ${sug.requirementId}. Skipping compilation and Playwright verification.\n`);
+    return true;
   }
 
   if (skipValidation) {
@@ -279,28 +378,58 @@ async function applyAndVerifySuggestion(
   let compiles = false;
   try {
     const { execSync } = require('child_process');
-    execSync('npx tsc --noEmit', { stdio: 'ignore', cwd: projectRoot });
+    execSync('npx tsc --noEmit', { stdio: 'pipe', cwd: projectRoot });
     compiles = true;
-  } catch (e) {
-    console.log(`\n${RED}${BOLD}❌ TypeScript compilation validation failed for ${sug.requirementId}.${RESET}`);
+  } catch (e: any) {
+    const errorOutput = ((e.stdout || '') + (e.stderr || '')).toString().trim();
+    console.log(`\n${RED}${BOLD}❌ TypeScript compilation failed for ${sug.requirementId}:${RESET}`);
+    if (errorOutput) {
+      // Print each compiler error line so the user sees exactly what went wrong
+      for (const line of errorOutput.split('\n').slice(0, 30)) {
+        console.log(`   ${DIM}${line}${RESET}`);
+      }
+    }
+    console.log(`${YELLOW}⚠️  Compilation failed — still running tests to show full picture.${RESET}\n`);
   }
 
-  if (!compiles) {
-    return false;
-  }
-
-  // 5. Playwright test verification
+  // 5. Playwright test verification — always run, even if compilation failed,
+  //    so the user sees the full error picture before continuing to the next suggestion.
   console.log(`\n🧪 Verifying changes for ${sug.requirementId}...`);
-  const testCmd = 'npx playwright test';
 
-  let success = false;
+  let testCmd = 'npx playwright test';
+  if (sug.action === 'ADD' || sug.action === 'MODIFY') {
+    if (sug.filePath) {
+      const normalizedPath = sug.filePath.replace(/\\/g, '/');
+      if (sug.testTitle) {
+        const escapedTitle = sug.testTitle.replace(/["]/g, '.');
+        testCmd = `npx playwright test "${normalizedPath}" -g "${escapedTitle}"`;
+      } else {
+        testCmd = `npx playwright test "${normalizedPath}"`;
+      }
+    }
+  }
+
+  console.log(`Running verification command: ${testCmd}`);
+
+  let testsPass = false;
   try {
     const { execSync } = require('child_process');
     execSync(testCmd, { stdio: 'inherit', cwd: projectRoot });
-    console.log(`\n${GREEN}${BOLD}✅ Verification Successful for ${sug.requirementId}!${RESET}\n`);
-    success = true;
+    testsPass = true;
   } catch (error: any) {
-    console.log(`\n${RED}${BOLD}❌ Verification Failed for ${sug.requirementId}.${RESET}\n`);
+    // Test output already printed via stdio: 'inherit' above
+  }
+
+  const success = compiles && testsPass;
+
+  if (success) {
+    console.log(`\n${GREEN}${BOLD}✅ Verification Successful for ${sug.requirementId}!${RESET}\n`);
+  } else if (!compiles && !testsPass) {
+    console.log(`\n${RED}${BOLD}❌ Verification Failed for ${sug.requirementId} — compilation errors and test failures.${RESET}\n`);
+  } else if (!compiles) {
+    console.log(`\n${RED}${BOLD}❌ Verification Failed for ${sug.requirementId} — compilation errors (tests may have passed).${RESET}\n`);
+  } else {
+    console.log(`\n${RED}${BOLD}❌ Verification Failed for ${sug.requirementId} — tests failed.${RESET}\n`);
   }
 
   // NOTE: Cache is updated at approval time (before this function is called),
@@ -503,10 +632,17 @@ async function main() {
     // Automatically update cache for REVIEW suggestions immediately (documentation changes only).
     // REVIEW = wording/title/goal change only, no code change needed, safe to update immediately.
     let reviewUpdatedCount = 0;
+    const reqDiffs = compareRequirementDocuments(prevRequirements, requirements);
     for (const sug of suggestions) {
       if (sug.classification === 'REVIEW') {
-        updateCacheForApprovedSuggestion(projectRoot, sug, requirements, prevRequirements);
-        reviewUpdatedCount++;
+        const normId = normalizeRequirementId(sug.requirementId);
+        const diff = reqDiffs.get(normId);
+        const isTrueReview = diff ? diff.classification === 'REVIEW' : true;
+
+        if (isTrueReview) {
+          updateCacheForApprovedSuggestion(projectRoot, sug, requirements, prevRequirements);
+          reviewUpdatedCount++;
+        }
       }
     }
     if (reviewUpdatedCount > 0) {
@@ -725,12 +861,14 @@ async function main() {
         const summary = {
           applied: [] as string[],
           failed: [] as string[],
-          skipped: [] as string[]
+          skipped: [] as string[],
+          pending: [] as string[]
         };
 
-        for (const sug of uniqueSuggestions) {
+        for (let si = 0; si < uniqueSuggestions.length; si++) {
+          const sug = uniqueSuggestions[si];
           console.log(`\n${BOLD}▸ Applying change for ${sug.requirementId} (${sug.title})...${RESET}`);
-          
+
           if (sug.classification === 'REVIEW') {
             // REVIEW changes have no code changes — apply directly by updating the cache
             try {
@@ -753,7 +891,7 @@ async function main() {
               requirements,
               prevRequirements,
               askQuestion,
-              true // Skip validation per suggestion
+              true // Skip validation per suggestion — run once at the end
             );
 
             if (success) {
@@ -762,40 +900,54 @@ async function main() {
             } else {
               summary.skipped.push(sug.requirementId);
             }
-          } catch (err) {
-            console.error(`❌ Failed to apply ${sug.requirementId}:`, err);
+          } catch (err: any) {
+            console.error(`\n${RED}❌ Error applying ${sug.requirementId} — skipping and continuing:${RESET}`, err?.message || err);
             summary.failed.push(sug.requirementId);
+            // Continue with the next suggestion — never abort the loop
           }
         }
 
-        // Run validation once at the end
-        console.log(`\n${BOLD}🔍 Running final validation checks...${RESET}`);
-        let validationSuccess = false;
-        try {
-          const { execSync } = require('child_process');
-          console.log(`Checking TypeScript compilation...`);
-          execSync('npx tsc --noEmit', { stdio: 'ignore', cwd: projectRoot });
-          console.log(`Running Playwright tests...`);
-          execSync('npx playwright test', { stdio: 'inherit', cwd: projectRoot });
-          validationSuccess = true;
-        } catch (e) {
-          // Keep going to print the summary
+        // Run validation once at the end (only if at least one suggestion was applied)
+        if (summary.applied.length > 0) {
+          console.log(`\n${BOLD}🔍 Running final validation checks...${RESET}`);
+          let validationSuccess = false;
+          try {
+            const { execSync } = require('child_process');
+            console.log(`Checking TypeScript compilation...`);
+            execSync('npx tsc --noEmit', { stdio: 'ignore', cwd: projectRoot });
+            console.log(`Running Playwright tests...`);
+            execSync('npx playwright test', { stdio: 'inherit', cwd: projectRoot });
+            validationSuccess = true;
+          } catch (e) {
+            // Keep going to print the summary
+          }
+          if (validationSuccess) {
+            console.log(`\n${GREEN}${BOLD}✅ Final verification successful: All tests passed!${RESET}\n`);
+            // Update cache for all successfully applied changes
+            for (const appliedReqId of summary.applied) {
+              const sug = uniqueSuggestions.find(s => s.requirementId === appliedReqId);
+              if (sug && sug.classification !== 'REVIEW') {
+                try {
+                  updateCacheForApprovedSuggestion(projectRoot, sug, requirements, prevRequirements);
+                } catch (cacheError) {
+                  console.error(`⚠️ Failed to update cache for suggestion ${sug.requirementId}:`, cacheError);
+                }
+              }
+            }
+          } else {
+            console.log(`\n${RED}${BOLD}❌ Final verification failed: Compiling or tests failed. Cache not updated.${RESET}\n`);
+          }
         }
 
-        // Display Summary
-        console.log(`\n${BOLD}======================================================${RESET}`);
-        console.log(`${BOLD}                APPLICATION SUMMARY                   ${RESET}`);
-        console.log(`${BOLD}======================================================${RESET}`);
-        console.log(`✅ ${GREEN}${BOLD}Applied Changes (${summary.applied.length}):${RESET} ${summary.applied.join(', ') || 'None'}`);
-        console.log(`❌ ${RED}${BOLD}Failed Changes (${summary.failed.length}):${RESET} ${summary.failed.join(', ') || 'None'}`);
-        console.log(`⚠️  ${YELLOW}${BOLD}Skipped Changes (${summary.skipped.length}):${RESET} ${summary.skipped.join(', ') || 'None'}`);
-        console.log(`${BOLD}======================================================${RESET}\n`);
-
-        if (validationSuccess) {
-          console.log(`${GREEN}${BOLD}✅ Final verification successful: All tests passed!${RESET}\n`);
-        } else {
-          console.log(`${RED}${BOLD}❌ Final verification failed: Compiling or tests failed.${RESET}\n`);
-        }
+        // Display Apply All Summary
+        console.log(`\n${BOLD}${'═'.repeat(54)}${RESET}`);
+        console.log(`${BOLD}              APPLICATION SUMMARY                     ${RESET}`);
+        console.log(`${BOLD}${'═'.repeat(54)}${RESET}`);
+        console.log(`  ✅ ${GREEN}${BOLD}Applied  (${summary.applied.length}):${RESET} ${summary.applied.join(', ') || 'None'}`);
+        console.log(`  ❌ ${RED}${BOLD}Failed   (${summary.failed.length}):${RESET} ${summary.failed.join(', ') || 'None'}`);
+        console.log(`  ⚠️  ${YELLOW}${BOLD}Skipped  (${summary.skipped.length}):${RESET} ${summary.skipped.join(', ') || 'None'}`);
+        console.log(`  ⏭  ${DIM}${BOLD}Pending  (${summary.pending.length}):${RESET} ${summary.pending.join(', ') || 'None'}`);
+        console.log(`${BOLD}${'═'.repeat(54)}${RESET}\n`);
       } else if (bulkChoice.toLowerCase() === 'r') {
         const orderedSuggestions = [
           ...projectSuggestions,
@@ -805,8 +957,21 @@ async function main() {
         ];
         let skipAll = false;
 
-        for (const sug of orderedSuggestions) {
-          if (skipAll) break;
+        const reviewSummary = {
+          applied: [] as string[],
+          failed: [] as string[],
+          skipped: [] as string[],
+          pending: [] as string[]
+        };
+
+        for (let ri = 0; ri < orderedSuggestions.length; ri++) {
+          const sug = orderedSuggestions[ri];
+
+          if (skipAll) {
+            // Mark all remaining suggestions as pending
+            reviewSummary.pending.push(sug.requirementId);
+            continue;
+          }
 
           const actionLabel = sug.action === 'ADD' ? 'NEW TEST'
             : sug.action === 'MODIFY' ? 'PATCH'
@@ -830,46 +995,48 @@ async function main() {
           }
 
           if (sug.action === 'ADD' || sug.action === 'MODIFY') {
-            console.log(`\n  ${BOLD}[OPTION 1] Diff:${RESET}`);
+            const hasOpt2 = (sug.proposedCodeOpt2 && sug.proposedCodeOpt2.trim() !== '' && sug.proposedCodeOpt2.trim().toLowerCase() !== 'none') ||
+                            (sug.patchDiffOpt2 && sug.patchDiffOpt2.trim() !== '' && sug.patchDiffOpt2.trim().toLowerCase() !== 'none');
+
+            if (hasOpt2) {
+              console.log(`\n  ${BOLD}[OPTION 1]:${RESET}`);
+            } else {
+              console.log(`\n  ${BOLD}[PROPOSED CHANGES]:${RESET}`);
+            }
+
             if (sug.patchDiff) {
-              for (const dl of sug.patchDiff.split('\n')) {
-                if (dl.startsWith('+')) console.log(`    ${GREEN}${dl}${RESET}`);
-                else if (dl.startsWith('-')) console.log(`    ${RED}${dl}${RESET}`);
-                else if (dl.startsWith('@@')) console.log(`    ${CYAN}${dl}${RESET}`);
-                else console.log(`    ${DIM}${dl}${RESET}`);
-              }
+              printCleanCodeDiff(sug.patchDiff);
             } else if (sug.proposedCode) {
               printDiff(sug.originalCode, sug.proposedCode);
             }
             if (sug.whyNeeded) {
-              console.log(`  ${BOLD}Why Option 1:${RESET} ${YELLOW}${sug.whyNeeded}${RESET}`);
+              console.log(`  ${BOLD}Reason/Why:${RESET} ${YELLOW}${sug.whyNeeded}${RESET}`);
             }
 
-            console.log(`\n  ${BOLD}[OPTION 2] Diff:${RESET}`);
-            if (sug.patchDiffOpt2) {
-              for (const dl of sug.patchDiffOpt2.split('\n')) {
-                if (dl.startsWith('+')) console.log(`    ${GREEN}${dl}${RESET}`);
-                else if (dl.startsWith('-')) console.log(`    ${RED}${dl}${RESET}`);
-                else if (dl.startsWith('@@')) console.log(`    ${CYAN}${dl}${RESET}`);
-                else console.log(`    ${DIM}${dl}${RESET}`);
+            if (hasOpt2) {
+              console.log(`\n  ${BOLD}[OPTION 2]:${RESET}`);
+              if (sug.patchDiffOpt2) {
+                printCleanCodeDiff(sug.patchDiffOpt2);
+              } else if (sug.proposedCodeOpt2) {
+                printDiff(sug.originalCode, sug.proposedCodeOpt2);
               }
-            } else if (sug.proposedCodeOpt2) {
-              printDiff(sug.originalCode, sug.proposedCodeOpt2);
-            }
-            if (sug.whyNeededOpt2) {
-              console.log(`  ${BOLD}Why Option 2:${RESET} ${YELLOW}${sug.whyNeededOpt2}${RESET}`);
+              if (sug.whyNeededOpt2) {
+                console.log(`  ${BOLD}Why Option 2:${RESET} ${YELLOW}${sug.whyNeededOpt2}${RESET}`);
+              }
             }
 
             console.log();
-            const optionChoice = await askQuestion(
-              `Apply this change? (1 = Option 1, 2 = Option 2, N = skip, S = skip all remaining) → `
-            );
+            const promptText = hasOpt2
+              ? `Apply this change? (1 = Option 1, 2 = Option 2, N = skip, S = skip all remaining) → `
+              : `Apply this change? (1 = Apply, N = skip, S = skip all remaining) → `;
+
+            const optionChoice = await askQuestion(promptText);
             const choiceClean = optionChoice.toLowerCase().trim();
             let approvedSug: Suggestion | null = null;
             if (choiceClean === '1') {
               approvedSug = sug;
-              console.log(`${GREEN}✓ Option 1 approved for application.${RESET}`);
-            } else if (choiceClean === '2') {
+              console.log(`${GREEN}✓ Approved for application.${RESET}`);
+            } else if (choiceClean === '2' && hasOpt2) {
               approvedSug = {
                 ...sug,
                 proposedCode: sug.proposedCodeOpt2,
@@ -879,14 +1046,32 @@ async function main() {
               console.log(`${GREEN}✓ Option 2 approved for application.${RESET}`);
             } else if (choiceClean === 's') {
               skipAll = true;
+              reviewSummary.pending.push(sug.requirementId);
               console.log(`${YELLOW}Skipping all remaining changes.${RESET}`);
             } else {
+              reviewSummary.skipped.push(sug.requirementId);
               console.log(`${DIM}Skipped.${RESET}`);
             }
 
             if (approvedSug) {
-              await applyAndVerifySuggestion(projectRoot, approvedSug, specFiles, validRequirementIds, requirements, prevRequirements, askQuestion);
-              changed = true;
+              try {
+                const applySuccess = await applyAndVerifySuggestion(projectRoot, approvedSug, specFiles, validRequirementIds, requirements, prevRequirements, askQuestion);
+                if (applySuccess) {
+                  try {
+                    updateCacheForApprovedSuggestion(projectRoot, approvedSug, requirements, prevRequirements);
+                  } catch (cacheError) {
+                    console.error(`⚠️ Failed to update cache for suggestion ${approvedSug.requirementId}:`, cacheError);
+                  }
+                  reviewSummary.applied.push(approvedSug.requirementId);
+                  changed = true;
+                } else {
+                  reviewSummary.failed.push(approvedSug.requirementId);
+                  console.log(`${YELLOW}⚠️  ${approvedSug.requirementId} was not applied — verification did not pass. Continuing with next suggestion.${RESET}`);
+                }
+              } catch (err: any) {
+                console.error(`\n${RED}❌ Error applying ${approvedSug.requirementId} — continuing with next suggestion:${RESET}`, err?.message || err);
+                reviewSummary.failed.push(approvedSug.requirementId);
+              }
             }
           } else {
             // REMOVE or NONE with configuration/locator updates
@@ -904,33 +1089,66 @@ async function main() {
               console.log(`${GREEN}✓ Approved for application.${RESET}`);
             } else if (choiceClean === 's') {
               skipAll = true;
+              reviewSummary.pending.push(sug.requirementId);
               console.log(`${YELLOW}Skipping all remaining changes.${RESET}`);
             } else {
+              reviewSummary.skipped.push(sug.requirementId);
               console.log(`${DIM}Skipped.${RESET}`);
             }
 
             if (approvedSug) {
-              await applyAndVerifySuggestion(projectRoot, approvedSug, specFiles, validRequirementIds, requirements, prevRequirements, askQuestion);
-              changed = true;
+              try {
+                const applySuccess = await applyAndVerifySuggestion(projectRoot, approvedSug, specFiles, validRequirementIds, requirements, prevRequirements, askQuestion);
+                if (applySuccess) {
+                  try {
+                    updateCacheForApprovedSuggestion(projectRoot, approvedSug, requirements, prevRequirements);
+                  } catch (cacheError) {
+                    console.error(`⚠️ Failed to update cache for suggestion ${approvedSug.requirementId}:`, cacheError);
+                  }
+                  reviewSummary.applied.push(approvedSug.requirementId);
+                  changed = true;
+                } else {
+                  reviewSummary.failed.push(approvedSug.requirementId);
+                  console.log(`${YELLOW}⚠️  ${approvedSug.requirementId} was not applied — verification did not pass. Continuing with next suggestion.${RESET}`);
+                }
+              } catch (err: any) {
+                console.error(`\n${RED}❌ Error applying ${approvedSug.requirementId} — continuing with next suggestion:${RESET}`, err?.message || err);
+                reviewSummary.failed.push(approvedSug.requirementId);
+              }
             }
           }
         }
+
+        // Display Review Summary
+        console.log(`\n${BOLD}${'═'.repeat(54)}${RESET}`);
+        console.log(`${BOLD}              APPLICATION SUMMARY                     ${RESET}`);
+        console.log(`${BOLD}${'═'.repeat(54)}${RESET}`);
+        console.log(`  ✅ ${GREEN}${BOLD}Applied  (${reviewSummary.applied.length}):${RESET} ${reviewSummary.applied.join(', ') || 'None'}`);
+        console.log(`  ❌ ${RED}${BOLD}Failed   (${reviewSummary.failed.length}):${RESET} ${reviewSummary.failed.join(', ') || 'None'}`);
+        console.log(`  ⚠️  ${YELLOW}${BOLD}Skipped  (${reviewSummary.skipped.length}):${RESET} ${reviewSummary.skipped.join(', ') || 'None'}`);
+        console.log(`  ⏭  ${DIM}${BOLD}Pending  (${reviewSummary.pending.length}):${RESET} ${reviewSummary.pending.join(', ') || 'None'}`);
+        console.log(`${BOLD}${'═'.repeat(54)}${RESET}\n`);
       }
+    }
+
+    // Ensure that any requirement removed from the active document is also removed from the baseline cache
+    if (fs.existsSync(cachePath)) {
+      try {
+        const raw = fs.readFileSync(cachePath, 'utf-8').trim();
+        if (raw && raw !== '[]') {
+          const cachedReqs: Requirement[] = JSON.parse(raw);
+          const activeIds = new Set(requirements.map(r => normalizeRequirementId(r.id)));
+          const filteredReqs = cachedReqs.filter(r => activeIds.has(normalizeRequirementId(r.id)));
+          if (filteredReqs.length !== cachedReqs.length) {
+            fs.writeFileSync(cachePath, JSON.stringify(filteredReqs, null, 2), 'utf-8');
+            console.log(`${GREEN}  ✓ Cleaned up removed requirements from baseline cache.${RESET}`);
+          }
+        }
+      } catch (e) { /* ignore */ }
     }
 
     if (!changed) {
       console.log(`\n${YELLOW}No changes were approved or applied.${RESET}\n`);
-    } else {
-      console.log(`\n${GREEN}${BOLD}✓ Successfully applied changes to test scripts!${RESET}\n`);
-    }
-
-    console.log(`${BOLD}🧪 Running Playwright tests...${RESET}\n`);
-    try {
-      const { execSync } = require('child_process');
-      execSync('npx playwright test', { stdio: 'inherit', cwd: projectRoot });
-      console.log(`\n${GREEN}${BOLD}✅ Verification Successful: All tests passed!${RESET}\n`);
-    } catch (error: any) {
-      console.log(`\n${RED}${BOLD}❌ Verification Failed: Some tests failed or an error occurred during execution.${RESET}\n`);
     }
     shouldRunAnalysis = false;
   }
